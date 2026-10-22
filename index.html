@@ -1,0 +1,496 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>StudyBuddy – Simulated Alexa+ Study Planner</title>
+  <style>
+    /* ---------- Theme ---------- */
+    :root {
+      --bg: #0f1b2d;
+      --card: #18283f;
+      --accent: #00caff;
+      --text: #eaf2ff;
+      --muted: #8ea3c0;
+      --danger: #ff7b7b;
+    }
+
+    /* ---------- Base ---------- */
+    * { box-sizing: border-box; }
+
+    body {
+      margin: 0;
+      font-family: system-ui, sans-serif;
+      background: var(--bg);
+      color: var(--text);
+    }
+
+    header {
+      padding: 16px 20px;
+      font-size: 20px;
+      font-weight: 700;
+    }
+
+    header small { color: var(--muted); font-weight: 400; }
+    .accent { color: var(--accent); }
+
+    /* ---------- Layout ---------- */
+    main {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 14px;
+      padding: 0 14px 14px;
+    }
+
+    @media (max-width: 800px) {
+      main { grid-template-columns: 1fr; }
+    }
+
+    .card {
+      background: var(--card);
+      border-radius: 14px;
+      padding: 14px;
+      min-height: 120px;
+    }
+
+    .card.spaced { margin-top: 14px; }
+
+    h2 {
+      margin: 0 0 8px;
+      font-size: 14px;
+      color: var(--muted);
+      text-transform: uppercase;
+      letter-spacing: 0.06em;
+    }
+
+    /* ---------- Chat ---------- */
+    #log {
+      height: 300px;
+      overflow: auto;
+      display: flex;
+      flex-direction: column;
+      gap: 8px;
+    }
+
+    .message {
+      padding: 8px 12px;
+      border-radius: 12px;
+      max-width: 85%;
+      white-space: pre-wrap;
+    }
+
+    .message.user {
+      align-self: flex-end;
+      background: #2a4a75;
+    }
+
+    .message.assistant {
+      align-self: flex-start;
+      background: #0b3b4d;
+      border: 1px solid var(--accent);
+    }
+
+    /* ---------- Controls ---------- */
+    .row { display: flex; gap: 8px; margin-top: 10px; }
+
+    input {
+      flex: 1;
+      padding: 10px;
+      border: 0;
+      border-radius: 10px;
+      background: var(--bg);
+      color: var(--text);
+    }
+
+    button {
+      padding: 10px 14px;
+      border: 0;
+      border-radius: 10px;
+      background: var(--accent);
+      color: #001;
+      font-weight: 700;
+      cursor: pointer;
+    }
+
+    .chips button {
+      margin: 4px 4px 0 0;
+      background: #223a5a;
+      color: var(--text);
+      font-size: 12px;
+      font-weight: 400;
+    }
+
+    /* ---------- Task list ---------- */
+    .task {
+      display: flex;
+      justify-content: space-between;
+      padding: 8px 0;
+      border-bottom: 1px solid #243a58;
+    }
+
+    .task .due { color: var(--muted); }
+    .task.done .title { text-decoration: line-through; color: var(--muted); }
+    .task.overdue .due { color: var(--danger); }
+    .empty { color: var(--muted); }
+
+    /* ---------- Tool-call trace ---------- */
+    pre {
+      margin: 0;
+      max-height: 160px;
+      overflow: auto;
+      font-size: 12px;
+      color: #9be7ff;
+      white-space: pre-wrap;
+    }
+  </style>
+</head>
+<body>
+  <header>
+    StudyBuddy <span class="accent">for Alexa+</span>
+    <small>(simulated)</small>
+  </header>
+
+  <main>
+    <!-- Left: conversation with the simulated assistant -->
+    <section class="card">
+      <h2>Talk to Alexa+</h2>
+      <div id="log"></div>
+      <div class="row">
+        <button id="mic" title="Speak">🎤</button>
+        <input id="input" placeholder='Try: "add Python quiz due Friday"'>
+        <button id="send">Send</button>
+      </div>
+      <div id="chips" class="chips"></div>
+    </section>
+
+    <!-- Right: assignments and the live tool-call trace -->
+    <section>
+      <div class="card">
+        <h2>My assignments</h2>
+        <div id="tasks"></div>
+      </div>
+      <div class="card spaced">
+        <h2>Agent tool calls (MCP-style)</h2>
+        <pre id="trace">—</pre>
+      </div>
+    </section>
+  </main>
+
+  <script>
+    /**
+     * StudyBuddy for Alexa+ (simulated)
+     *
+     * Flow:  user speech/text  ->  understand()  ->  tools[name](args)  ->  reply
+     *
+     * The `tools` object mirrors the actions an MCP server would expose to Alexa+.
+     * Each call is printed in the "Agent tool calls" panel so it is visible in the demo.
+     */
+    'use strict';
+
+    /* ================================================================
+     * 1. State and constants
+     * ================================================================ */
+
+    const STORAGE_KEY = 'studybuddy_tasks';
+    const WEEKDAYS = ['sunday', 'monday', 'tuesday', 'wednesday', 'thursday', 'friday', 'saturday'];
+    const EXAMPLES = [
+      'add Python quiz due Friday',
+      "add C++ assignment due in 3 days",
+      "what's due",
+      'plan my week',
+      'finished Python quiz',
+    ];
+
+    /** Each task looks like: { title: string, due: 'YYYY-MM-DD' | null, done: boolean } */
+    let tasks = JSON.parse(localStorage.getItem(STORAGE_KEY) || '[]');
+
+    const el = {
+      log: document.querySelector('#log'),
+      input: document.querySelector('#input'),
+      send: document.querySelector('#send'),
+      mic: document.querySelector('#mic'),
+      chips: document.querySelector('#chips'),
+      tasks: document.querySelector('#tasks'),
+      trace: document.querySelector('#trace'),
+    };
+
+    /* ================================================================
+     * 2. Date helpers (all dates are local, formatted as YYYY-MM-DD)
+     * ================================================================ */
+
+    function startOfToday() {
+      const d = new Date();
+      d.setHours(0, 0, 0, 0);
+      return d;
+    }
+
+    function toISODate(date) {
+      const month = String(date.getMonth() + 1).padStart(2, '0');
+      const day = String(date.getDate()).padStart(2, '0');
+      return `${date.getFullYear()}-${month}-${day}`;
+    }
+
+    function prettyDate(isoDate) {
+      return new Date(isoDate + 'T00:00').toLocaleDateString('en-ZA', {
+        weekday: 'long',
+        day: 'numeric',
+        month: 'short',
+      });
+    }
+
+    /**
+     * Finds a due date in free text.
+     * Understands: today, tomorrow, "in N days", a weekday name, or YYYY-MM-DD.
+     * Returns an ISO date string, or null if no date was found.
+     */
+    function parseDate(text) {
+      const date = startOfToday();
+      let match;
+
+      if (/\btoday\b/.test(text)) {
+        // already today
+      } else if (/\btomorrow\b/.test(text)) {
+        date.setDate(date.getDate() + 1);
+      } else if ((match = text.match(/in (\d+) days?/))) {
+        date.setDate(date.getDate() + Number(match[1]));
+      } else if ((match = text.match(/\b(sunday|monday|tuesday|wednesday|thursday|friday|saturday)\b/))) {
+        // Next occurrence of that weekday (a full week ahead if it is today).
+        const daysAhead = (WEEKDAYS.indexOf(match[1]) - date.getDay() + 7) % 7 || 7;
+        date.setDate(date.getDate() + daysAhead);
+      } else if ((match = text.match(/(\d{4}-\d{2}-\d{2})/))) {
+        return match[1];
+      } else {
+        return null;
+      }
+      return toISODate(date);
+    }
+
+    /* ================================================================
+     * 3. Tools (what an MCP server would expose to Alexa+)
+     * ================================================================ */
+
+    function saveTasks() {
+      localStorage.setItem(STORAGE_KEY, JSON.stringify(tasks));
+      renderTasks();
+    }
+
+    function findTask(query) {
+      const q = query.toLowerCase().trim();
+      return tasks.find((task) => task.title.toLowerCase().includes(q));
+    }
+
+    const tools = {
+      add_task({ title, due }) {
+        tasks.push({ title, due, done: false });
+        saveTasks();
+        return `Done. I added "${title}"` + (due ? `, due ${prettyDate(due)}.` : '.');
+      },
+
+      list_tasks() {
+        const pending = tasks
+          .filter((task) => !task.done)
+          .sort((a, b) => (a.due || '9999').localeCompare(b.due || '9999'));
+
+        if (pending.length === 0) return 'You have nothing pending. Nice work!';
+
+        const lines = pending.map(
+          (task) => `• ${task.title}` + (task.due ? ` – ${prettyDate(task.due)}` : '')
+        );
+        return `You have ${pending.length} pending:\n` + lines.join('\n');
+      },
+
+      complete_task({ query }) {
+        const task = findTask(query);
+        if (!task) return `I couldn't find "${query}".`;
+        task.done = true;
+        saveTasks();
+        return `Great job! "${task.title}" is marked done.`;
+      },
+
+      delete_task({ query }) {
+        const task = findTask(query);
+        if (!task) return `I couldn't find "${query}".`;
+        tasks = tasks.filter((t) => t !== task);
+        saveTasks();
+        return `Removed "${task.title}".`;
+      },
+
+      /** Schedules a one-hour study session the day before each deadline. */
+      plan_week() {
+        const upcoming = tasks
+          .filter((task) => !task.done && task.due)
+          .sort((a, b) => a.due.localeCompare(b.due));
+
+        if (upcoming.length === 0) {
+          return "Add some assignments with due dates and I'll plan your week.";
+        }
+
+        const today = toISODate(startOfToday());
+        const lines = upcoming.map((task) => {
+          const dayBefore = new Date(task.due + 'T00:00');
+          dayBefore.setDate(dayBefore.getDate() - 1);
+          const sessionDay = toISODate(dayBefore) < today ? today : toISODate(dayBefore);
+          const overdue = task.due < today ? ' ⚠ overdue!' : '';
+          return `• ${prettyDate(sessionDay)}: study "${task.title}"${overdue}`;
+        });
+        return "Here's your study plan (1 hour each):\n" + lines.join('\n');
+      },
+    };
+
+    /* ================================================================
+     * 4. Intent parsing (stands in for Alexa+'s language understanding)
+     * ================================================================ */
+
+    /**
+     * Turns a sentence into [toolName, args], or null if nothing matches.
+     * Order matters: the first matching rule wins.
+     */
+    function understand(rawText) {
+      const text = rawText.toLowerCase().trim();
+      let match;
+
+      // "plan my week"
+      if (/\bplan\b/.test(text)) return ['plan_week', {}];
+
+      // "finished Python quiz" / "done with Python quiz"
+      if ((match = text.match(/^(?:mark |i )?(?:finished|completed?|done(?: with)?)\s+(.+)/))) {
+        return ['complete_task', { query: match[1].replace(/\s+as done$/, '') }];
+      }
+
+      // "mark Python quiz as done"
+      if ((match = text.match(/^mark (.+?) (?:as )?(?:done|complete)/))) {
+        return ['complete_task', { query: match[1] }];
+      }
+
+      // "delete Python quiz"
+      if ((match = text.match(/^(?:delete|remove)\s+(.+)/))) {
+        return ['delete_task', { query: match[1] }];
+      }
+
+      // "what's due" / "show my assignments"
+      if (/(what|show|list|read).*(due|tasks?|assignments?|homework|pending)/.test(text)) {
+        return ['list_tasks', {}];
+      }
+
+      // "add Python quiz due Friday"
+      if ((match = text.match(/^(?:add|create|remind me to|remind me)\s+(?:an? )?(?:assignment |task )?(.+)/))) {
+        const title = match[1].split(/\s+(?:due|by|on|for)\s+/)[0].trim();
+        return ['add_task', { title: title.charAt(0).toUpperCase() + title.slice(1), due: parseDate(text) }];
+      }
+
+      return null;
+    }
+
+    /* ================================================================
+     * 5. User interface
+     * ================================================================ */
+
+    function speak(text) {
+      if (!window.speechSynthesis) return;
+      window.speechSynthesis.cancel();
+      window.speechSynthesis.speak(new SpeechSynthesisUtterance(text.replace(/[•⚠]/g, '')));
+    }
+
+    /** Adds a chat bubble. `sender` is 'user' or 'assistant'. */
+    function addMessage(text, sender) {
+      const bubble = document.createElement('div');
+      bubble.className = `message ${sender}`;
+      bubble.textContent = text;
+      el.log.append(bubble);
+      el.log.scrollTop = el.log.scrollHeight;
+      if (sender === 'assistant') speak(text);
+    }
+
+    function renderTasks() {
+      el.tasks.replaceChildren();
+
+      if (tasks.length === 0) {
+        el.tasks.innerHTML = '<span class="empty">Nothing yet.</span>';
+        return;
+      }
+
+      const today = toISODate(startOfToday());
+      for (const task of tasks) {
+        const row = document.createElement('div');
+        row.className = 'task';
+        if (task.done) row.classList.add('done');
+        if (!task.done && task.due && task.due < today) row.classList.add('overdue');
+
+        const title = document.createElement('span');
+        title.className = 'title';
+        title.textContent = task.title;
+
+        const due = document.createElement('span');
+        due.className = 'due';
+        due.textContent = task.due ? prettyDate(task.due) : '';
+
+        row.append(title, due);
+        el.tasks.append(row);
+      }
+    }
+
+    /** Handles one user utterance end to end. */
+    function handleUtterance(text) {
+      if (!text.trim()) return;
+      addMessage(text, 'user');
+
+      const result = understand(text);
+      if (!result) {
+        el.trace.textContent = 'no tool matched';
+        addMessage(
+          'Sorry, I didn\'t catch that. Try "add Python quiz due Friday", "what\'s due", ' +
+            '"plan my week", or "finished Python quiz".',
+          'assistant'
+        );
+        return;
+      }
+
+      const [toolName, args] = result;
+      el.trace.textContent = `tools/call → ${toolName}(${JSON.stringify(args)})`;
+      addMessage(tools[toolName](args), 'assistant');
+    }
+
+    /* ================================================================
+     * 6. Start-up
+     * ================================================================ */
+
+    function setupSpeechInput() {
+      const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
+      if (!SpeechRecognition) {
+        el.mic.style.display = 'none'; // typing still works
+        return;
+      }
+      const recognition = new SpeechRecognition();
+      recognition.lang = 'en-US';
+      recognition.onresult = (event) => handleUtterance(event.results[0][0].transcript);
+      el.mic.onclick = () => recognition.start();
+    }
+
+    function setupExampleChips() {
+      for (const example of EXAMPLES) {
+        const chip = document.createElement('button');
+        chip.textContent = example;
+        chip.onclick = () => handleUtterance(example);
+        el.chips.append(chip);
+      }
+    }
+
+    function init() {
+      el.send.onclick = () => {
+        handleUtterance(el.input.value);
+        el.input.value = '';
+      };
+      el.input.onkeydown = (event) => {
+        if (event.key === 'Enter') el.send.click();
+      };
+
+      setupSpeechInput();
+      setupExampleChips();
+      renderTasks();
+      addMessage("Hi, I'm Alexa+ with the StudyBuddy skill. Tell me about your assignments!", 'assistant');
+    }
+
+    init();
+  </script>
+</body>
+</html>
